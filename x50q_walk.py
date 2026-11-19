@@ -9,7 +9,8 @@ Protocol summary:
     Each update: 25 reports of 64 bytes, sent in the order implemented by
     make_batch(). Each report starts with 07 opcode 06 chunk, then 60 payload
     bytes. Color arrays contain 144-slot R, G, and B planes with 60-byte
-    chunks and 48 bytes of trailing padding.
+    chunks and 48 bytes of trailing padding. Per-key effect selectors are
+    stored by LED slot in opcode 0x0D.
 
 The key-to-slot map is based on controlled one-key-at-a-time color captures.
 The effect selector values are based on Q Software captures. Hardware behavior
@@ -18,10 +19,13 @@ for each effect/color combination should be confirmed on the target device.
 Example:
     sudo python3 x50q_walk.py --rgb ff0000 --delay 0.8
     sudo python3 x50q_walk.py --key x --color 00ff00
-    sudo python3 x50q_walk.py --key x --color 000000 --effect ripple --effect-color ff0000
+    sudo python3 x50q_walk.py --key x --color 000000 --keydown-effect ripple --keydown-effect-color ff0000
+    sudo python3 x50q_walk.py --key x --key-effect blink --key-effect-color ff0000
+    sudo python3 x50q_walk.py --key x --key-effect color-cycle
     sudo python3 x50q_walk.py --key leftpipe --color ff0000
     sudo python3 x50q_walk.py --key q-ring --color 0000ff
     sudo python3 x50q_walk.py --device 5:2 --key x --color ff0000
+    sudo python3 x50q_walk.py --device 5:2 --rgb ff0000 --delay 0.8
 
 By default each step lights only the current target (spotlight mode). Pass
 --accumulate to leave previously visited LEDs lit. Use --loops 0 to repeat
@@ -93,7 +97,7 @@ TARGETS = KEYS + [("Q button ring", Q_RING_SLOTS)]
 # Captured from Q Software in the order: Set color, Blink, Breathe, Ripple,
 # Laser, Color cycle, Inward ripple, None. The pair is stored at byte 37 of
 # chunk zero in opcodes 0x0F and 0x0E respectively.
-EFFECT_CODES = {
+KEYDOWN_EFFECT_CODES = {
     "set-color": (0x02, 0x00),
     "blink": (0x03, 0x04),
     "breathe": (0x03, 0x01),
@@ -102,6 +106,17 @@ EFFECT_CODES = {
     "color-cycle": (0x05, 0x03),
     "inward-ripple": (0x05, 0x06),
     "none": (0x05, 0x00),
+}
+
+# Per-key lighting mode selector values are stored by LED slot in opcode 0x0D.
+# "Set color" and "none" both use selector zero; Q Software makes the none
+# state black, so the sender also clears both color planes for that target.
+KEY_EFFECT_CODES = {
+    "set-color": 0x00,
+    "none": 0x00,
+    "breathe": 0x01,
+    "color-cycle": 0x03,
+    "blink": 0x04,
 }
 
 # CLI names are intentionally short for the controls most useful while
@@ -176,19 +191,21 @@ def make_report(opcode, chunk, payload):
     return report
 
 
-def make_batch(slot_colors, ring_color, effect="set-color", effect_colors=None):
+def make_batch(slot_colors, ring_color, keydown_effect="set-color",
+               keydown_effect_colors=None,
+               key_effects=None):
     """Build a complete state update from protocol fields.
 
-    Opcodes 0x0F, 0x0E and 0x0D are fixed zero-filled three-chunk blocks.
-    0x0A carries the keydown-effect color plane; 0x09 carries the steady
-    color plane and Q ring. If no separate effect color is supplied, the
-    selected key colors are mirrored into both. The Q ring was observed
-    changing only in 0x09, so its four slots are added to that stream alone.
+    Opcodes 0x0F and 0x0E carry the keydown-effect selector. Opcode 0x0D
+    carries one per-key effect selector per LED slot. Opcode 0x0A carries the
+    keydown-effect color plane; 0x09 carries the steady color plane and Q
+    ring. If no separate keydown-effect color is supplied, selected key colors are
+    mirrored into both color planes.
     """
     # Opcode 0x0A carries the keydown-effect color plane. If a separate color
     # wasn't supplied, mirror the steady color for backward compatibility.
-    effect_array = make_color_array(
-        slot_colors if effect_colors is None else effect_colors
+    keydown_effect_array = make_color_array(
+        slot_colors if keydown_effect_colors is None else keydown_effect_colors
     )
     ring_stream_colors = dict(slot_colors)
     if ring_color is not None:
@@ -196,31 +213,42 @@ def make_batch(slot_colors, ring_color, effect="set-color", effect_colors=None):
             ring_stream_colors[slot] = ring_color
     ring_stream = make_color_array(ring_stream_colors)
 
+    key_effect_array = bytearray(3 * PAYLOAD_SIZE)
+    for slot, key_effect in (key_effects or {}).items():
+        if not 0 <= slot < SLOTS:
+            raise ValueError(f"LED slot outside 0..{SLOTS - 1}: {slot}")
+        if key_effect not in KEY_EFFECT_CODES:
+            raise ValueError(f"unknown per-key effect: {key_effect!r}")
+        key_effect_array[slot] = KEY_EFFECT_CODES[key_effect]
+
     reports = []
-    effect_group, effect_mode = EFFECT_CODES[effect]
+    effect_group, effect_mode = KEYDOWN_EFFECT_CODES[keydown_effect]
     for opcode, value in ((0x0F, effect_group), (0x0E, effect_mode)):
         for chunk in range(3):
             payload = bytearray(PAYLOAD_SIZE)
             if chunk == 0:
                 payload[33] = value  # report byte 37
             reports.append(make_report(opcode, chunk, payload))
-    for opcode, data in ((0x0A, effect_array), (0x0D, None), (0x09, ring_stream)):
+    for opcode, data in (
+        (0x0A, keydown_effect_array),
+        (0x0D, key_effect_array),
+        (0x09, ring_stream),
+    ):
         chunks = range(3) if opcode == 0x0D else range(8)
         for chunk in chunks:
-            payload = (
-                bytes(PAYLOAD_SIZE)
-                if data is None
-                else data[chunk * PAYLOAD_SIZE:(chunk + 1) * PAYLOAD_SIZE]
-            )
+            payload = data[chunk * PAYLOAD_SIZE:(chunk + 1) * PAYLOAD_SIZE]
             reports.append(make_report(opcode, chunk, payload))
     if len(reports) != 25:
         raise AssertionError(f"Expected 25 reports, built {len(reports)}")
     return reports
 
 
-def send_batch(device, slot_colors, ring_color, effect="set-color", effect_colors=None):
+def send_batch(device, slot_colors, ring_color, keydown_effect="set-color",
+               keydown_effect_colors=None,
+               key_effects=None):
     for report_number, report in enumerate(
-        make_batch(slot_colors, ring_color, effect, effect_colors), 1
+        make_batch(slot_colors, ring_color, keydown_effect,
+                   keydown_effect_colors, key_effects), 1
     ):
         try:
             written = device.write(OUT_ENDPOINT, report, timeout=1000)
@@ -291,7 +319,17 @@ def open_keyboard(device_selector=None):
                 detached = True
         except NotImplementedError:
             pass
-        usb.util.claim_interface(device, INTERFACE)
+        try:
+            usb.util.claim_interface(device, INTERFACE)
+        except Exception as exc:
+            if getattr(exc, "errno", None) == 16:
+                detail = "interface is busy; close any other software using the keyboard"
+            else:
+                detail = f"interface claim failed: {exc}"
+            raise RuntimeError(
+                f"Could not claim X50Q interface {INTERFACE} at USB "
+                f"{device.bus}:{device.address}: {detail}"
+            ) from exc
         return device, usb.util, detached
     except Exception:
         if detached:
@@ -322,8 +360,8 @@ def main():
     parser.add_argument("--rgb", "--color", dest="rgb", type=parse_rgb,
                         default=parse_rgb("ff0000"),
                         help="test color as RRGGBB (default: ff0000)")
-    parser.add_argument("--effect-color", type=parse_rgb,
-                        help="keydown animation color as RRGGBB (defaults to --color)")
+    parser.add_argument("--keydown-effect-color", type=parse_rgb,
+                        help="keydown effect color as RRGGBB (defaults to --color)")
     parser.add_argument("--delay", type=float, default=0.8,
                         help="seconds to display each target (default: 0.8)")
     parser.add_argument("--loops", type=int, default=1,
@@ -334,8 +372,12 @@ def main():
                         help="set one target instead of walking (e.g. x, leftpipe, q-ring)")
     parser.add_argument("--device", type=parse_device_selector, metavar="BUS:ADDRESS",
                         help="select a specific matching keyboard (e.g. 5:2)")
-    parser.add_argument("--effect", choices=tuple(EFFECT_CODES), default="set-color",
+    parser.add_argument("--keydown-effect", choices=tuple(KEYDOWN_EFFECT_CODES), default="set-color",
                         help="keydown effect (default: set-color)")
+    parser.add_argument("--key-effect", choices=tuple(KEY_EFFECT_CODES),
+                        help="per-key lighting effect (set-color/none both use selector 0)")
+    parser.add_argument("--key-effect-color", type=parse_rgb,
+                        help="per-key RGB color (defaults to --rgb; ignored for --key-effect none)")
     parser.add_argument("--list-keys", action="store_true",
                         help="list accepted --key names and exit")
     args = parser.parse_args()
@@ -343,6 +385,8 @@ def main():
         parser.error("--delay cannot be negative")
     if args.loops < 0:
         parser.error("--loops cannot be negative")
+    if args.key_effect_color is not None and args.key_effect is None:
+        parser.error("--key-effect-color requires --key-effect")
     if args.list_keys:
         print(" ".join(sorted(KEY_MAP)))
         return 0
@@ -360,50 +404,99 @@ def main():
         if resolved is not None:
             label, slots = resolved
             is_ring = label == "Q button ring"
-            active = {} if is_ring else {slot: args.rgb for slot in slots}
-            ring_color = args.rgb if is_ring else None
-            effect_rgb = args.effect_color or args.rgb
-            effect_colors = {slot: effect_rgb for slot in active}
-            color_description = f"base #{bytes(args.rgb).hex().upper()}"
+            base_rgb = (
+                (0, 0, 0) if args.key_effect == "none"
+                else args.key_effect_color or args.rgb
+            )
+            active = {} if is_ring else {slot: base_rgb for slot in slots}
+            ring_color = base_rgb if is_ring else None
+            keydown_effect_rgb = (
+                (0, 0, 0) if args.key_effect == "none"
+                else args.keydown_effect_color or (
+                    base_rgb if args.key_effect is not None else args.rgb
+                )
+            )
+            keydown_effect_colors = {
+                slot: keydown_effect_rgb for slot in slots if not is_ring
+            }
+            key_effects = (
+                {slot: args.key_effect for slot in slots}
+                if args.key_effect is not None else {}
+            )
+            color_description = f"base #{bytes(base_rgb).hex().upper()}"
             if not is_ring:
-                color_description += f", effect #{bytes(effect_rgb).hex().upper()}"
+                color_description += (
+                    f", keydown effect #{bytes(keydown_effect_rgb).hex().upper()}"
+                )
+            if args.key_effect is not None:
+                color_description += f", per-key effect {args.key_effect}"
             print(
                 f"Setting {label} (slot{'s' if len(slots) != 1 else ''} "
-                f"{', '.join(map(str, slots))}) -> {color_description} [{args.effect}]",
+                f"{', '.join(map(str, slots))}) -> {color_description} "
+                f"[keydown {args.keydown_effect}]",
                 flush=True,
             )
-            send_batch(device, active, ring_color, args.effect, effect_colors)
+            send_batch(device, active, ring_color, args.keydown_effect,
+                       keydown_effect_colors, key_effects)
             return 0
 
         pass_number = 0
+        accumulated_key_effects = {}
         while args.loops == 0 or pass_number < args.loops:
             pass_number += 1
             for index, (label, slots) in enumerate(TARGETS, start=1):
                 is_ring = label == "Q button ring"
+                base_rgb = (
+                    (0, 0, 0) if args.key_effect == "none"
+                    else args.key_effect_color or args.rgb
+                )
                 if args.accumulate and not is_ring:
                     for slot in slots:
-                        accumulated[slot] = args.rgb
+                        accumulated[slot] = base_rgb
+                        if args.key_effect is not None:
+                            accumulated_key_effects[slot] = args.key_effect
                     active = dict(accumulated)
                     ring_color = accumulated_ring
                 elif args.accumulate:
                     active = dict(accumulated)
-                    accumulated_ring = args.rgb
+                    accumulated_ring = base_rgb
                     ring_color = accumulated_ring
+                    if args.key_effect is not None:
+                        for slot in slots:
+                            accumulated_key_effects[slot] = args.key_effect
                 elif is_ring:
                     active = {}
-                    ring_color = args.rgb
+                    ring_color = base_rgb
                 else:
-                    active = {slot: args.rgb for slot in slots}
+                    active = {slot: base_rgb for slot in slots}
                     ring_color = None
-                effect_rgb = args.effect_color or args.rgb
-                effect_colors = {slot: effect_rgb for slot in active}
+                if args.key_effect is not None and not args.accumulate:
+                    key_effects = {slot: args.key_effect for slot in slots}
+                elif args.accumulate:
+                    key_effects = dict(accumulated_key_effects)
+                else:
+                    key_effects = {}
+                keydown_effect_rgb = (
+                    (0, 0, 0) if args.key_effect == "none"
+                    else args.keydown_effect_color or (
+                        base_rgb if args.key_effect is not None else args.rgb
+                    )
+                )
+                keydown_effect_colors = {
+                    slot: keydown_effect_rgb for slot in active
+                }
+                mode_details = f" [keydown {args.keydown_effect}]"
+                if args.key_effect is not None:
+                    mode_details += f" [per-key {args.key_effect}]"
                 print(
                     f"Pass {pass_number}: [{index}/{len(TARGETS)}] "
-                    f"{label} -> base #{bytes(args.rgb).hex().upper()}, "
-                    f"effect #{bytes(effect_rgb).hex().upper()} [{args.effect}]",
+                    f"{label} -> base #{bytes(base_rgb).hex().upper()}, "
+                    f"keydown color #{bytes(keydown_effect_rgb).hex().upper()}"
+                    f"{mode_details}",
                     flush=True,
                 )
-                send_batch(device, active, ring_color, args.effect, effect_colors)
+                send_batch(device, active, ring_color, args.keydown_effect,
+                           keydown_effect_colors, key_effects)
                 time.sleep(args.delay)
     except KeyboardInterrupt:
         print("\nStopped; the last displayed target remains lit.")
